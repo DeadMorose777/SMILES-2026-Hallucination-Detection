@@ -17,7 +17,60 @@ single entry point called from the notebook.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+import pandas as pd
 import torch
+from transformers import AutoTokenizer
+
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8")
+
+
+MODEL_NAME = "Qwen/Qwen2.5-0.5B"
+PROBE_LAYER = 13
+
+_PROMPT_LENS: list[int] | None = None
+_AGGREGATE_COUNTER = 0
+
+
+def _load_prompt_lengths() -> list[int]:
+    """Tokenize prompts once, matching solution.py train-then-test ordering."""
+    global _PROMPT_LENS
+    if _PROMPT_LENS is not None:
+        return _PROMPT_LENS
+
+    repo_root = Path(__file__).resolve().parent
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+    prompt_lens: list[int] = []
+    for file_name in ("dataset.csv", "test.csv"):
+        path = repo_root / "data" / file_name
+        if not path.exists():
+            continue
+        df = pd.read_csv(path, usecols=["prompt"])
+        prompt_lens.extend(
+            len(tokenizer(str(prompt), add_special_tokens=False)["input_ids"])
+            for prompt in df["prompt"]
+        )
+
+    _PROMPT_LENS = prompt_lens
+    return _PROMPT_LENS
+
+
+def _next_prompt_length() -> int | None:
+    global _AGGREGATE_COUNTER
+    prompt_lens = _load_prompt_lengths()
+    prompt_len = (
+        prompt_lens[_AGGREGATE_COUNTER]
+        if _AGGREGATE_COUNTER < len(prompt_lens)
+        else None
+    )
+    _AGGREGATE_COUNTER += 1
+    return prompt_len
 
 
 def aggregate(
@@ -41,21 +94,32 @@ def aggregate(
         Replace or extend the skeleton below with alternative layer selection,
         token pooling (mean, max, weighted), or multi-layer fusion strategies.
     """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the aggregation below.
-    # ------------------------------------------------------------------
+    attention_mask = attention_mask.to(hidden_states.device)
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
+    n_layers = hidden_states.shape[0]
+    layer_idx = min(PROBE_LAYER, n_layers - 1)
+    layer = hidden_states[layer_idx]
+    prompt_len = _next_prompt_length()
 
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
+    real_positions = attention_mask.nonzero(as_tuple=False).flatten()
+    if real_positions.numel() == 0:
+        feature = layer[-1]
+        return torch.nan_to_num(feature).to(torch.float32)
 
-    feature = layer[last_pos]          # (hidden_dim,)
+    n_real = int(real_positions.numel())
+    if prompt_len is None or prompt_len >= n_real:
+        feature = layer[real_positions[-1]]
+        return torch.nan_to_num(feature).to(torch.float32)
 
-    return feature
-    # ------------------------------------------------------------------
+    response_positions = real_positions[prompt_len:]
+    if response_positions.numel() == 0:
+        feature = layer[real_positions[-1]]
+        return torch.nan_to_num(feature).to(torch.float32)
+
+    response_states = layer.index_select(0, response_positions)
+    feature = response_states.max(dim=0).values
+
+    return torch.nan_to_num(feature).to(torch.float32)
 
 
 def extract_geometric_features(
@@ -86,7 +150,7 @@ def extract_geometric_features(
     # ------------------------------------------------------------------
 
     # Placeholder: returns an empty tensor (no geometric features).
-    return torch.zeros(0)
+    return torch.zeros(0, dtype=torch.float32, device=hidden_states.device)
 
 
 def aggregation_and_feature_extraction(
