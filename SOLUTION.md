@@ -2,68 +2,50 @@
 
 ## Run
 
-From the repository root:
-
 ```bash
 pip install -r requirements.txt
 python solution.py
 ```
 
-My run used Python 3.12.10, PyTorch 2.11.0+cu128, CUDA, and an RTX 4090.
+Verified locally with Python 3.12.10, PyTorch 2.11.0+cu128, CUDA, and an RTX 4090.
 
-The solution only changes:
+## Changes
 
-- `aggregation.py`
-- `probe.py`
-- `splitting.py`
+* changed `aggregation.py`, `probe.py`, and `splitting.py`
+* fixed files `solution.py`, `evaluate.py`, and `model.py` are unchanged
 
-The original `solution.py`, `evaluate.py`, and `model.py` are unchanged.
+## Method
 
-## Approach
+The solution uses frozen Qwen2.5-0.5B hidden states. `solution.py` feeds the full prompt plus response, so `aggregation.py` recovers the response boundary by tokenizing prompts from `data/dataset.csv` and `data/test.csv` in the official extraction order.
 
-I use Qwen2.5-0.5B only as a frozen feature extractor.
+The final aggregation mode is `max_l12_l13`: response-token max pooling from layer 12 concatenated with response-token max pooling from layer 13. This gives a 1792-dimensional feature vector. If the response span cannot be recovered safely, the fallback preserves the same feature dimension by using the last real token.
 
-The baseline last-token representation felt too narrow, so I switched to response-only features. Since `aggregate()` does not receive token ids or prompt boundaries, I recover prompt lengths inside `aggregation.py` by tokenizing the prompts from `data/dataset.csv` and `data/test.csv` in the same order as the official extraction loop.
-
-For each sample, I take layer 13 and max-pool hidden states over the response span. If the response span cannot be recovered safely, the code falls back to the last real token.
-
-This gives one 896-dimensional vector per sample.
-
-The probe is deliberately simple:
-
-- `StandardScaler`
-- `LogisticRegression(C=0.01)`
-- 5 bootstrap resamples
-- averaged probabilities
-
-The threshold is selected inside `fit()` using out-of-fold predictions. I do it there because the final prediction path calls `fit()` and then immediately writes `predictions.csv`.
+The probe is `StandardScaler` plus `LogisticRegression`. The regularization strength is selected inside `fit()` from `CANDIDATE_C = (0.003, 0.01, 0.03, 0.1)` using out-of-fold predictions. The final model is a 5-model bootstrap ensemble with averaged probabilities, and the decision threshold is also tuned inside `fit()`.
 
 ## Validation
 
-I use 5-fold stratified validation on the labelled `dataset.csv`. The reported numbers below are held-out fold metrics. I do not report accuracy for the final `data/test.csv`, since its labels are not public.
+Validation uses 5-fold stratified validation on labelled `dataset.csv`. The metrics are held-out fold metrics. I do not report accuracy for unlabelled `data/test.csv`.
 
 ## Results
 
 | Metric | Value |
 |---|---:|
 | Majority baseline accuracy | 0.7010 |
-| Held-out accuracy | 0.7489 |
-| Held-out F1 | 0.8329 |
-| Held-out AUROC | 0.7869 |
-| Feature dimension | 896 |
+| Held-out accuracy | 0.7590 |
+| Held-out F1 | 0.8431 |
+| Held-out AUROC | 0.7911 |
+| Feature dimension | 1792 |
 | Number of folds | 5 |
 
-## What I did not keep
+## Notes
 
-I did not use the MLP probe from the starter code. With only 689 labelled examples, it is easy to overfit.
-
-I also avoided a larger multi-layer PCA setup in the final version. It added complexity, while the response-only 896-dimensional probe was simpler and gave a solid validation score.
+There is no Qwen fine-tuning. I did not keep an MLP as the final probe because the labelled dataset is small. I tested a few response-only aggregation variants locally and kept the layer 12 plus layer 13 max-pooling variant for its balance of quality and simplicity.
 
 ## Output
 
-Running `python solution.py` creates:
+`python solution.py` creates:
 
-- `results.json`
-- `predictions.csv`
+* `results.json`
+* `predictions.csv`
 
-`predictions.csv` has the required `id,label` format.
+`predictions.csv` format: `id,label`

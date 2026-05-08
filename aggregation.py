@@ -1,18 +1,9 @@
 """
-aggregation.py — Token aggregation strategy and feature extraction
-               (student-implemented).
+aggregation.py - Token aggregation strategy and feature extraction.
 
-Converts per-token, per-layer hidden states from the extraction loop in
-``solution.py`` into flat feature vectors for the probe classifier.
-
-Two stages can be customised independently:
-
-  1. ``aggregate`` — select layers and token positions, pool into a vector.
-  2. ``extract_geometric_features`` — optional hand-crafted features
-     (enabled by setting ``USE_GEOMETRIC = True`` in ``solution.py``).
-
-Both stages are combined by ``aggregation_and_feature_extraction``, the
-single entry point called from the notebook.
+The official pipeline passes only hidden states and an attention mask. To build
+response-only features, this module reconstructs prompt lengths by tokenizing
+the prompts from the train and test CSV files in the same order as solution.py.
 """
 
 from __future__ import annotations
@@ -31,14 +22,14 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 MODEL_NAME = "Qwen/Qwen2.5-0.5B"
-PROBE_LAYER = 13
+AGGREGATION_MODE = "max_l12_l13"
 
 _PROMPT_LENS: list[int] | None = None
 _AGGREGATE_COUNTER = 0
 
 
 def _load_prompt_lengths() -> list[int]:
-    """Tokenize prompts once, matching solution.py train-then-test ordering."""
+    """Tokenize prompts once in solution.py call order: dataset, then test."""
     global _PROMPT_LENS
     if _PROMPT_LENS is not None:
         return _PROMPT_LENS
@@ -58,66 +49,114 @@ def _load_prompt_lengths() -> list[int]:
         )
 
     _PROMPT_LENS = prompt_lens
-    return _PROMPT_LENS
+    return prompt_lens
 
 
 def _next_prompt_length() -> int | None:
     global _AGGREGATE_COUNTER
     prompt_lens = _load_prompt_lengths()
-    prompt_len = (
-        prompt_lens[_AGGREGATE_COUNTER]
-        if _AGGREGATE_COUNTER < len(prompt_lens)
-        else None
-    )
+    prompt_len = None
+    if _AGGREGATE_COUNTER < len(prompt_lens):
+        prompt_len = prompt_lens[_AGGREGATE_COUNTER]
     _AGGREGATE_COUNTER += 1
     return prompt_len
+
+
+def _safe_layer(hidden_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
+    idx = min(layer_idx, hidden_states.shape[0] - 1)
+    return hidden_states[idx]
+
+
+def _max_pool(layer: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    return layer.index_select(0, positions).max(dim=0).values
+
+
+def _mean_pool(layer: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    return layer.index_select(0, positions).mean(dim=0)
+
+
+def _fallback_feature(hidden_states: torch.Tensor, token_pos: int | torch.Tensor) -> torch.Tensor:
+    layer_13 = _safe_layer(hidden_states, 13)
+    if AGGREGATION_MODE in {"max_mean_l13", "max_last_l13"}:
+        token = layer_13[token_pos]
+        return torch.cat([token, token], dim=0)
+
+    layer_12 = _safe_layer(hidden_states, 12)
+    if AGGREGATION_MODE == "max_l12_l13":
+        return torch.cat([layer_12[token_pos], layer_13[token_pos]], dim=0)
+
+    if AGGREGATION_MODE == "max_mean_l12_l13":
+        token_12 = layer_12[token_pos]
+        token_13 = layer_13[token_pos]
+        return torch.cat([token_12, token_12, token_13, token_13], dim=0)
+
+    raise ValueError(f"Unknown AGGREGATION_MODE: {AGGREGATION_MODE}")
 
 
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Convert per-token hidden states into a single feature vector.
-
-    Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
-                        Layer index 0 is the token embedding; index -1 is the
-                        final transformer layer.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
-
-    Returns:
-        A 1-D feature tensor of shape ``(hidden_dim,)`` or
-        ``(k * hidden_dim,)`` if multiple layers are concatenated.
-
-    Student task:
-        Replace or extend the skeleton below with alternative layer selection,
-        token pooling (mean, max, weighted), or multi-layer fusion strategies.
-    """
+    """Convert per-token hidden states into one fixed-size feature vector."""
     attention_mask = attention_mask.to(hidden_states.device)
 
-    n_layers = hidden_states.shape[0]
-    layer_idx = min(PROBE_LAYER, n_layers - 1)
-    layer = hidden_states[layer_idx]
+    real_positions = attention_mask.nonzero(as_tuple=False).flatten()
     prompt_len = _next_prompt_length()
 
-    real_positions = attention_mask.nonzero(as_tuple=False).flatten()
     if real_positions.numel() == 0:
-        feature = layer[-1]
+        feature = _fallback_feature(hidden_states, -1)
         return torch.nan_to_num(feature).to(torch.float32)
 
     n_real = int(real_positions.numel())
     if prompt_len is None or prompt_len >= n_real:
-        feature = layer[real_positions[-1]]
+        feature = _fallback_feature(hidden_states, real_positions[-1])
         return torch.nan_to_num(feature).to(torch.float32)
 
     response_positions = real_positions[prompt_len:]
     if response_positions.numel() == 0:
-        feature = layer[real_positions[-1]]
+        feature = _fallback_feature(hidden_states, real_positions[-1])
         return torch.nan_to_num(feature).to(torch.float32)
 
-    response_states = layer.index_select(0, response_positions)
-    feature = response_states.max(dim=0).values
+    layer_13 = _safe_layer(hidden_states, 13)
+
+    if AGGREGATION_MODE == "max_mean_l13":
+        feature = torch.cat(
+            [
+                _max_pool(layer_13, response_positions),
+                _mean_pool(layer_13, response_positions),
+            ],
+            dim=0,
+        )
+    elif AGGREGATION_MODE == "max_last_l13":
+        feature = torch.cat(
+            [
+                _max_pool(layer_13, response_positions),
+                layer_13[response_positions[-1]],
+            ],
+            dim=0,
+        )
+    elif AGGREGATION_MODE == "max_l12_l13":
+        layer_12 = _safe_layer(hidden_states, 12)
+        feature = torch.cat(
+            [
+                _max_pool(layer_12, response_positions),
+                _max_pool(layer_13, response_positions),
+            ],
+            dim=0,
+        )
+    elif AGGREGATION_MODE == "max_mean_l12_l13":
+        layer_12 = _safe_layer(hidden_states, 12)
+        feature = torch.cat(
+            [
+                _max_pool(layer_12, response_positions),
+                _mean_pool(layer_12, response_positions),
+                _max_pool(layer_13, response_positions),
+                _mean_pool(layer_13, response_positions),
+            ],
+            dim=0,
+        )
+    else:
+        raise ValueError(f"Unknown AGGREGATION_MODE: {AGGREGATION_MODE}")
 
     return torch.nan_to_num(feature).to(torch.float32)
 
@@ -126,30 +165,7 @@ def extract_geometric_features(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Extract hand-crafted geometric / statistical features from hidden states.
-
-    Called only when ``USE_GEOMETRIC = True`` in ``solution.ipynb``.  The
-    returned tensor is concatenated with the output of ``aggregate``.
-
-    Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
-
-    Returns:
-        A 1-D float tensor of shape ``(n_geometric_features,)``.  The length
-        must be the same for every sample.
-
-    Student task:
-        Replace the stub below.  Possible features: layer-wise activation
-        norms, inter-layer cosine similarity (representation drift), or
-        sequence length.
-    """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the geometric feature extraction below.
-    # ------------------------------------------------------------------
-
-    # Placeholder: returns an empty tensor (no geometric features).
+    """Optional geometric features are disabled by solution.py."""
     return torch.zeros(0, dtype=torch.float32, device=hidden_states.device)
 
 
@@ -158,26 +174,8 @@ def aggregation_and_feature_extraction(
     attention_mask: torch.Tensor,
     use_geometric: bool = False,
 ) -> torch.Tensor:
-    """Aggregate hidden states and optionally append geometric features.
-
-    Main entry point called from ``solution.ipynb`` for each sample.
-    Concatenates the output of ``aggregate`` with that of
-    ``extract_geometric_features`` when ``use_geometric=True``.
-
-    Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``
-                        for a single sample.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
-        use_geometric:  Whether to append geometric features.  Controlled by
-                        the ``USE_GEOMETRIC`` flag in ``solution.ipynb``.
-
-    Returns:
-        A 1-D float tensor of shape ``(feature_dim,)`` where
-        ``feature_dim = hidden_dim`` (or larger for multi-layer or geometric
-        concatenations).
-    """
-    agg_features = aggregate(hidden_states, attention_mask)  # (feature_dim,)
+    """Aggregate hidden states and optionally append geometric features."""
+    agg_features = aggregate(hidden_states, attention_mask)
 
     if use_geometric:
         geo_features = extract_geometric_features(hidden_states, attention_mask)

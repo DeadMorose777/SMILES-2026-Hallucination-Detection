@@ -9,6 +9,7 @@ predictions.csv
 # Results
 results.json
 *.json
+local_experiments/
 
 # HuggingFace model cache
 .cache/
